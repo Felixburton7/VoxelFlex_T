@@ -1,8 +1,8 @@
-# src/voxelflex/data/validators.py (Optimized)
 """
 Data validation module for VoxelFlex (Temperature-Aware).
 
-Validates aggregated RMSF data. Voxel validation happens during loading.
+Provides validation functions for input data formats, focusing on RMSF data.
+Voxel validation happens during loading rather than separately.
 """
 
 import logging
@@ -17,18 +17,18 @@ logger = logging.getLogger("voxelflex.data")
 def validate_aggregated_rmsf_data(rmsf_df: pd.DataFrame) -> pd.DataFrame:
     """
     Validate aggregated RMSF DataFrame for required columns, types, and potential issues.
-    Optimized version with reduced redundant checks.
-
+    
     Args:
         rmsf_df: DataFrame loaded from the aggregated RMSF CSV.
-
+        
     Returns:
-        Validated (potentially filtered) DataFrame.
-
+        Validated and potentially filtered DataFrame.
+        
     Raises:
         ValueError: If input is empty or essential columns are missing/invalid.
     """
     logger.info("Validating aggregated RMSF data...")
+    
     if not isinstance(rmsf_df, pd.DataFrame) or rmsf_df.empty:
         raise ValueError("Input RMSF data is not a non-empty DataFrame.")
 
@@ -48,17 +48,17 @@ def validate_aggregated_rmsf_data(rmsf_df: pd.DataFrame) -> pd.DataFrame:
     if missing_req:
         raise ValueError(f"Aggregated RMSF data missing required columns: {missing_req}. Found: {list(df_validated.columns)}")
 
-    # Optional columns
+    # Optional columns for stratification and analysis
     optional_cols = ['relative_accessibility', 'dssp', 'secondary_structure_encoded']
     ss_col_found = 'dssp' in df_validated.columns or 'secondary_structure_encoded' in df_validated.columns
     available_optional = [col for col in optional_cols if col in df_validated.columns]
     
-    # Log status only once at the beginning
+    # Log initial state
     initial_rows = len(df_validated)
     logger.info(f"Initial RMSF rows: {initial_rows}")
 
     # --- Optimize Type Conversion ---
-    # Use predefined types for these columns - more efficient than multiple conversions
+    # Use predefined types for numeric columns - more efficient than multiple conversions
     type_mapping = {
         'resid': 'Int64',  # Use nullable Int type to handle potential NaNs
         'temperature_feature': float,
@@ -79,24 +79,27 @@ def validate_aggregated_rmsf_data(rmsf_df: pd.DataFrame) -> pd.DataFrame:
     orig_len = len(df_validated)
     df_validated.dropna(subset=list(required_cols.keys()), inplace=True)
     rows_dropped_nan = orig_len - len(df_validated)
+    
     if rows_dropped_nan > 0:
         logger.info(f"Dropped {rows_dropped_nan} rows due to NaN/invalid values in required columns.")
 
-    # Check for negative RMSF and fix
+    # Check and fix negative RMSF values
     if 'target_rmsf' in df_validated.columns:
         neg_rmsf_mask = df_validated['target_rmsf'] < 0
         neg_count = neg_rmsf_mask.sum()
+        
         if neg_count > 0:
             logger.warning(f"Found {neg_count} negative 'target_rmsf' values. Setting them to 0.")
             df_validated.loc[neg_rmsf_mask, 'target_rmsf'] = 0.0
 
-    # Check for duplicate (domain_id, resid, temperature_feature) entries
+    # Check for duplicate entries (domain_id, resid, temperature_feature)
     key_cols = ['domain_id', 'resid', 'temperature_feature']
     if all(c in df_validated.columns for c in key_cols):
         # Handle the resid/Int64 conversion properly
         try:
             duplicates_mask = df_validated.duplicated(subset=key_cols, keep='first')
             dup_count = duplicates_mask.sum()
+            
             if dup_count > 0:
                 logger.warning(f"Found {dup_count} duplicate entries based on {key_cols}. Keeping first occurrence.")
                 df_validated = df_validated[~duplicates_mask]
@@ -105,6 +108,7 @@ def validate_aggregated_rmsf_data(rmsf_df: pd.DataFrame) -> pd.DataFrame:
 
     # --- Summarize Results ---
     final_rows = len(df_validated)
+    
     if initial_rows > 0:
         percentage_str = f"({final_rows / initial_rows:.1%})"
     else:
@@ -115,7 +119,7 @@ def validate_aggregated_rmsf_data(rmsf_df: pd.DataFrame) -> pd.DataFrame:
     if final_rows == 0:
         raise ValueError("No valid RMSF data remaining after validation.")
 
-    # --- Log Summary Statistics (reduced to essentials) ---
+    # --- Log Summary Statistics ---
     logger.info("Summary statistics of validated RMSF data:")
     try:
         logger.info(f"  Unique Domains: {df_validated['domain_id'].nunique()}")

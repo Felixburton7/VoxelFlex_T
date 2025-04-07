@@ -1,4 +1,9 @@
-# src/voxelflex/cli/commands/preprocess.py (Optimized)
+"""
+Preprocessing command for VoxelFlex (Temperature-Aware).
+
+Performs metadata-only preprocessing - creating the master samples list
+and temperature scaling parameters without processing voxel data.
+"""
 
 import os
 import time
@@ -30,20 +35,37 @@ from voxelflex.utils.logging_utils import (
 )
 from voxelflex.utils.file_utils import ensure_dir, save_json, load_json, load_list_from_file, save_list_to_file, resolve_path
 from voxelflex.utils.system_utils import clear_memory
+from voxelflex.utils.temp_scaling import calculate_and_save_temp_scaling
 
-MASTER_SAMPLES_FILENAME = "master_samples.parquet" # Default to Parquet
+MASTER_SAMPLES_FILENAME = "master_samples.parquet"  # Default to Parquet
 
-def run_preprocessing(config: Dict[str, Any]):
+def run_preprocessing(config: Dict[str, Any]) -> bool:
     """
     Main function for metadata-only preprocessing.
     Generates and saves master sample list and temperature scaler.
+    
+    Args:
+        config: Configuration dictionary
+        
+    Returns:
+        True if preprocessing succeeded, False otherwise
+        
+    Raises:
+        Various exceptions may be raised for data or file issues
     """
-    if MASTER_SAMPLES_FILENAME.endswith(".parquet") and not PYARROW_AVAILABLE:
-        raise ImportError("PyArrow needed for Parquet output. `pip install pyarrow`")
+    if MASTER_SAMPLES_FILENAME.endswith(".parquet"):
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+            PYARROW_AVAILABLE = True
+        except ImportError:
+            logger.error("PyArrow needed for Parquet output. Please install with `pip install pyarrow`")
+            raise ImportError("PyArrow needed for Parquet output. `pip install pyarrow`")
 
     log_section_header(logger, "STARTING PREPROCESSING (Metadata Only)")
     start_time = time.time()
 
+    # Extract paths from config
     input_cfg = config['input']
     data_cfg = config['data']
     output_cfg = config['output']
@@ -53,6 +75,7 @@ def run_preprocessing(config: Dict[str, Any]):
     run_output_dir = output_cfg['run_dir']
     master_samples_output_path = os.path.join(processed_dir, MASTER_SAMPLES_FILENAME)
 
+    # Ensure output directories exist
     ensure_dir(processed_dir)
     ensure_dir(run_output_dir)
 
@@ -185,9 +208,7 @@ def run_preprocessing(config: Dict[str, Any]):
                         for chain_key in potential_chain_keys:
                             try:
                                 chain_group = f_h5[hdf5_domain_id][chain_key]
-                                # Check if any residue IDs exist (must be digit strings
-                                # (continuing src/voxelflex/cli/commands/preprocess.py)
-                                # Check for residue keys (must be digit strings)
+                                # Check if any residue IDs exist (must be digit strings)
                                 if any(k.isdigit() for k in chain_group.keys()):
                                     residue_group = chain_group
                                     break
@@ -235,9 +256,10 @@ def run_preprocessing(config: Dict[str, Any]):
                                             target_rmsf >= 0):
                                             
                                             # Create a sample with all required fields
+                                            # Ensure domain_id and resid_str are strings
                                             master_samples_list.append({
-                                                'hdf5_domain_id': hdf5_domain_id,
-                                                'resid_str': resid_str,
+                                                'hdf5_domain_id': str(hdf5_domain_id),
+                                                'resid_str': str(resid_str),
                                                 'resid_int': resid_int,
                                                 'raw_temp': float(raw_temp),
                                                 'target_rmsf': float(target_rmsf),
@@ -261,7 +283,7 @@ def run_preprocessing(config: Dict[str, Any]):
                         logger.warning(f"Error processing domain {hdf5_domain_id}: {e}")
                         failed_domains.add(hdf5_domain_id)
 
-                    progress_domains.update(1) # Update progress
+                    progress_domains.update(1)  # Update progress
                 
             progress_domains.finish()
 
@@ -292,7 +314,7 @@ def run_preprocessing(config: Dict[str, Any]):
             
             try:
                 if MASTER_SAMPLES_FILENAME.endswith(".parquet"):
-                    # Use pyarrow with specified schema for more efficient storage
+                    # Use pyarrow with specified schema for more efficient storage and proper types
                     schema = pa.schema([
                         ('hdf5_domain_id', pa.string()),
                         ('resid_str', pa.string()),
@@ -318,6 +340,11 @@ def run_preprocessing(config: Dict[str, Any]):
             if not os.path.exists(master_samples_output_path) or os.path.getsize(master_samples_output_path) == 0:
                 raise RuntimeError(f"Master sample file {master_samples_output_path} not created/empty.")
 
+            # Calculate temperature scaling using training samples
+            train_samples = master_samples_df[master_samples_df['split'] == 'train']
+            train_temps = train_samples['raw_temp'].tolist()
+            temp_min, temp_max = calculate_and_save_temp_scaling(train_temps, temp_scaling_params_path)
+
         # --- 5. Final Summary ---
         log_section_header(logger, "PREPROCESSING FINISHED (Metadata Only)")
         total_duration = time.time() - start_time
@@ -339,6 +366,8 @@ def run_preprocessing(config: Dict[str, Any]):
         else:
             logger.info("No domains completely failed during initial checks/mapping.")
 
+        return True
+
     except Exception as e:
         logger.exception(f"Metadata preprocessing pipeline failed: {e}")
         if failed_domains:
@@ -348,7 +377,7 @@ def run_preprocessing(config: Dict[str, Any]):
                 logger.info(f"Saved partial failed domains list: {failed_list_path}")
             except:
                 pass
-        raise
+        return False
     finally:
         if 'master_samples_list' in locals():
             del master_samples_list

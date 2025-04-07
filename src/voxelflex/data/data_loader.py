@@ -1,761 +1,736 @@
-# src/voxelflex/data/data_loader.py (Optimized)
-"""
-Data loading module for VoxelFlex (Temperature-Aware).
-
-Defines:
-- SafeDomainCache: Thread-safe caching system for domain data
-- VoxelDataset: Loads sample metadata from file and reads/processes HDF5 voxels on demand.
-- PredictionDataset: Minimal dataset for prediction, loading raw voxels on demand.
-- Helper functions for loading raw RMSF data and creating lookups/mappings.
-- Robust function for loading raw voxel data from HDF5.
-"""
-
+# src/voxelflex/data/data_loader.py (Chunked IterableDataset Implementation for All Splits)
 import os
+from pathlib import Path
 import logging
 import time
 import gc
 import h5py
 import json
 import psutil
-from typing import Dict, List, Tuple, Optional, Union, Any, Callable, Set
+import math
+from typing import Dict, List, Tuple, Optional, Union, Any, Callable, Set, Iterator
 from collections import defaultdict, OrderedDict, namedtuple
 
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, IterableDataset, get_worker_info
 
-# Check for PyArrow and import
 try:
     import pyarrow.parquet as pq
     PYARROW_AVAILABLE = True
 except ImportError:
     PYARROW_AVAILABLE = False
 
-logger = logging.getLogger("voxelflex.data") # Use parent logger name
+logger = logging.getLogger("voxelflex.data")
 
-# Internal imports
+# Utils and Validators (ensure they are imported)
 from voxelflex.data.validators import validate_aggregated_rmsf_data
 from voxelflex.utils.file_utils import resolve_path, ensure_dir, load_json, save_json
 from voxelflex.utils.logging_utils import EnhancedProgressBar
 
-# Define master samples filename constant
+# --- Constants and Helpers ---
 MASTER_SAMPLES_FILENAME = "master_samples.parquet"
+TARGET_SHAPE: Tuple[int, int, int, int] = (5, 21, 21, 21)
+TARGET_DTYPE: np.dtype = np.dtype(np.float32)
+INPUT_CHANNELS: int = TARGET_SHAPE[0]
 
-# Define a global HDF5 file handle for worker processes
-worker_h5_file = None
-
-# --- Domain Cache Implementation ---
-class SafeDomainCache:
-    """
-    Thread-safe, memory-safe cache for domain voxel data.
-    Uses LRU (Least Recently Used) strategy with memory monitoring.
-    """
-    def __init__(self, max_size_mb=2000, monitor_memory=True, memory_limit_percent=75):
-        """
-        Initialize the cache with memory safety limits.
-        
-        Args:
-            max_size_mb: Maximum cache size in MB (default 2000MB/2GB)
-            monitor_memory: Whether to monitor system memory usage
-            memory_limit_percent: Emergency clear if memory exceeds this percentage
-        """
-        self.cache = {}
-        self.domain_sizes = {}
-        self.access_order = []
-        self.max_size_bytes = max_size_mb * 1024 * 1024
-        self.current_size_bytes = 0
-        self.monitor_memory = monitor_memory
-        self.memory_limit_percent = memory_limit_percent
-        
-        # Statistics
-        self.hits = 0
-        self.misses = 0
-        self.evictions = 0
-        self.emergency_clears = 0
-        
-        logger.info(f"Initialized SafeDomainCache: Max size: {max_size_mb}MB, Memory monitoring: {monitor_memory}")
-    
-    def get(self, domain_id: str) -> Optional[Dict[str, np.ndarray]]:
-        """
-        Get a domain from the cache.
-        
-        Args:
-            domain_id: The domain ID to retrieve
-            
-        Returns:
-            The cached domain data or None if not in cache
-        """
-        domain_data = self.cache.get(domain_id)
-        
-        if domain_data is not None:
-            # Update access order for LRU
-            if domain_id in self.access_order:
-                self.access_order.remove(domain_id)
-            self.access_order.append(domain_id)
-            self.hits += 1
-            return domain_data
-        
-        self.misses += 1
-        return None
-    
-    def add(self, domain_id: str, domain_data: Dict[str, np.ndarray]) -> bool:
-        """
-        Add a domain to the cache with memory safety checks.
-        
-        Args:
-            domain_id: The domain ID to cache
-            domain_data: Dict mapping residue_ids to voxel arrays
-            
-        Returns:
-            True if domain was added, False if skipped for safety
-        """
-        # Check for memory pressure if monitoring enabled
-        if self.monitor_memory and psutil.virtual_memory().percent > self.memory_limit_percent:
-            logger.warning(f"System memory usage ({psutil.virtual_memory().percent}%) exceeds limit ({self.memory_limit_percent}%). Emergency cache clear.")
-            self.clear()
-            self.emergency_clears += 1
-            return False
-        
-        # Skip if already in cache
-        if domain_id in self.cache:
-            # Update access order
-            if domain_id in self.access_order:
-                self.access_order.remove(domain_id)
-            self.access_order.append(domain_id)
-            return True
-        
-        # Calculate size of domain data
-        domain_size = sum(arr.nbytes for arr in domain_data.values() if hasattr(arr, 'nbytes'))
-        
-        # Skip caching overly large domains (>25% of total cache)
-        if domain_size > (self.max_size_bytes * 0.25):
-            logger.info(f"Domain {domain_id} too large ({domain_size/1024/1024:.1f}MB) for cache")
-            return False
-        
-        # Make room in cache if needed
-        while self.current_size_bytes + domain_size > self.max_size_bytes and self.access_order:
-            self._remove_oldest()
-        
-        # Add to cache
-        self.cache[domain_id] = domain_data
-        self.domain_sizes[domain_id] = domain_size
-        self.access_order.append(domain_id)
-        self.current_size_bytes += domain_size
-        
-        return True
-    
-    def _remove_oldest(self) -> None:
-        """Remove the least recently used domain from cache."""
-        if not self.access_order:
-            return
-        
-        oldest_key = self.access_order.pop(0)
-        
-        if oldest_key in self.cache:
-            size = self.domain_sizes.pop(oldest_key, 0)
-            self.cache.pop(oldest_key)
-            self.current_size_bytes -= size
-            self.evictions += 1
-    
-    def clear(self) -> None:
-        """Completely clear the cache."""
-        self.cache.clear()
-        self.domain_sizes.clear()
-        self.access_order.clear()
-        self.current_size_bytes = 0
-    
-    def get_stats(self) -> Dict[str, Any]:
-        """Get cache statistics."""
-        hit_rate = self.hits / (self.hits + self.misses) * 100 if (self.hits + self.misses) > 0 else 0
-        return {
-            "size_mb": self.current_size_bytes / (1024 * 1024),
-            "max_size_mb": self.max_size_bytes / (1024 * 1024),
-            "usage_percent": (self.current_size_bytes / self.max_size_bytes) * 100 if self.max_size_bytes > 0 else 0,
-            "num_domains": len(self.cache),
-            "hits": self.hits,
-            "misses": self.misses,
-            "hit_rate_percent": hit_rate,
-            "evictions": self.evictions,
-            "emergency_clears": self.emergency_clears
-        }
-
-# Create a namedtuple for samples to avoid pandas overhead during training
-Sample = namedtuple('Sample', ['hdf5_domain_id', 'resid_str', 'resid_int', 'raw_temp', 'target_rmsf', 'split'])
-
-class VoxelDataset(Dataset):
-    """
-    Dataset that loads metadata from a master sample file (CSV or Parquet)
-    and reads/processes corresponding voxel data from HDF5 on demand.
-    """
-    def __init__(
-        self,
-        processed_dir: str,
-        split: str, # 'train', 'val', or 'test'
-        voxel_hdf5_path: str,
-        config: Dict[str, Any],
-        # Voxel shape/channel info needed by load_process_voxels_from_hdf5
-        expected_channels: int = 5,
-        target_shape_chw: Optional[Tuple[int, int, int, int]] = (5, 21, 21, 21)
-    ):
-        """
-        Initializes the dataset by loading and filtering the master sample list.
-
-        Args:
-            processed_dir: Directory containing the master sample file.
-            split: Which dataset split to load ('train', 'val', or 'test').
-            voxel_hdf5_path: Path to the raw HDF5 voxel file.
-            config: Configuration dictionary
-            expected_channels: Expected channels for voxel processing.
-            target_shape_chw: Expected final voxel shape for validation.
-        """
-        self.processed_dir = resolve_path(processed_dir)
-        self.split = split
-        self.voxel_hdf5_path = resolve_path(voxel_hdf5_path)
-        self.expected_channels = expected_channels
-        self.target_shape_chw = target_shape_chw
-        self.samples = []  # Store as list of namedtuples instead of DataFrame
-        self.domain_mapping = {}  # Cache domain mapping
-        
-        # Initialize domain cache
-        cache_size_mb = config.get('data', {}).get('domain_cache_mb', 2000)
-        monitor_memory = config.get('data', {}).get('monitor_memory', True)
-        self.domain_cache = SafeDomainCache(max_size_mb=cache_size_mb, monitor_memory=monitor_memory)
-        
-        # Hard-coded temperature scaling constants based on dataset
-        # These would typically come from a preprocessing analysis
-        self.temp_min = 280.0
-        self.temp_max = 360.0
-
-        master_file_path = os.path.join(self.processed_dir, MASTER_SAMPLES_FILENAME)
-
-        if not os.path.exists(master_file_path):
-            logger.error(f"Master sample file not found: {master_file_path}. Dataset for split '{split}' will be empty.")
-            return
-        if not os.path.exists(self.voxel_hdf5_path):
-             logger.error(f"Voxel HDF5 file not found: {self.voxel_hdf5_path}. Cannot load voxels.")
-             return # Cannot function without voxels
-
-        try:
-            logger.info(f"Loading master samples from {master_file_path} for split '{split}'...")
-            t0 = time.time()
-            
-            # Load only necessary columns
-            if MASTER_SAMPLES_FILENAME.endswith(".parquet"):
-                if not PYARROW_AVAILABLE: raise ImportError("PyArrow needed to read .parquet master file.")
-                cols_to_read = ['hdf5_domain_id', 'resid_str', 'raw_temp', 'target_rmsf', 'split']
-                master_df = pd.read_parquet(master_file_path, columns=cols_to_read)
-            else: # Assume CSV
-                master_df = pd.read_csv(master_file_path, low_memory=False, usecols=['hdf5_domain_id', 'resid_str', 'raw_temp', 'target_rmsf', 'split'])
-
-            t1 = time.time()
-            logger.info(f"Loaded {len(master_df)} total samples in {t1-t0:.2f}s.")
-
-            # Filter for the required split
-            filtered_df = master_df[master_df['split'] == self.split].copy()
-            
-            # Convert DataFrame to list of namedtuples (more efficient for __getitem__)
-            for _, row in filtered_df.iterrows():
-                self.samples.append(Sample(
-                    hdf5_domain_id=str(row['hdf5_domain_id']),  # Ensure string type
-                    resid_str=str(row['resid_str']),            # Ensure string type
-                    resid_int=int(row['resid_str']),            # Pre-convert to int
-                    raw_temp=float(row['raw_temp']),            # Ensure float type
-                    target_rmsf=float(row['target_rmsf']),      # Ensure float type
-                    split=self.split
-                ))
-            
-            logger.info(f"Filtered to {len(self.samples)} samples for split '{split}'.")
-            
-            # Load domain mapping if available (serialized during preprocessing)
-            mapping_path = os.path.join(self.processed_dir, "domain_mapping.json")
-            if os.path.exists(mapping_path):
-                try:
-                    self.domain_mapping = load_json(mapping_path)
-                    logger.info(f"Loaded domain mapping with {len(self.domain_mapping)} entries")
-                except Exception as e:
-                    logger.warning(f"Could not load domain mapping: {e}")
-
-            if not self.samples and len(master_df) > 0:
-                 logger.warning(f"No samples found for split '{split}' in {master_file_path}.")
-            elif self.samples:
-                 logger.info(f"Initialized VoxelDataset for split '{split}'.")
-
-        except Exception as e:
-            logger.exception(f"Error loading or filtering master sample file {master_file_path} for split '{split}': {e}")
-            self.samples = []  # Ensure samples is empty on error
-
-    def __len__(self) -> int:
-        """Return the number of samples in this split."""
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> Optional[Dict[str, torch.Tensor]]:
-        """
-        Retrieves sample metadata, loads/processes voxel data on demand,
-        and returns the sample dictionary for the DataLoader.
-
-        Args:
-            idx: The index of the sample to retrieve.
-
-        Returns:
-            A dictionary {'voxels': Tensor, 'scaled_temps': Tensor, 'targets': Tensor},
-            or None if retrieval/voxel loading fails for this sample.
-        """
-        if not self.samples or idx >= len(self.samples):
-            return None # Return None if index out of range or dataset is empty
-
-        try:
-            # Get sample metadata (now from namedtuple)
-            sample = self.samples[idx]
-            hdf5_domain_id = sample.hdf5_domain_id
-            resid_str = sample.resid_str
-            raw_temp = sample.raw_temp
-            target_rmsf = sample.target_rmsf
-
-            # Try to get domain data from cache first
-            domain_data = self.domain_cache.get(hdf5_domain_id)
-            
-            # If not in cache, load and process from HDF5
-            if domain_data is None:
-                # Use persistent worker HDF5 handle if available
-                global worker_h5_file
-                use_persistent = worker_h5_file is not None
-                
-                if use_persistent:
-                    # Use the persistent connection
-                    domain_data = load_process_domain_from_handle(
-                        worker_h5_file,
-                        hdf5_domain_id,
-                        expected_channels=self.expected_channels,
-                        target_shape_chw=self.target_shape_chw
-                    )
-                else:
-                    # Fall back to opening the file
-                    domain_data = load_process_voxels_from_hdf5(
-                        self.voxel_hdf5_path,
-                        domain_ids=[hdf5_domain_id],
-                        expected_channels=self.expected_channels,
-                        target_shape_chw=self.target_shape_chw,
-                        log_per_residue=False
-                    ).get(hdf5_domain_id, {})
-                
-                # Add to cache if loading succeeded
-                if domain_data:
-                    self.domain_cache.add(hdf5_domain_id, domain_data)
-
-            # Extract the specific residue's processed array
-            voxel_np = None if domain_data is None else domain_data.get(resid_str)
-
-            if voxel_np is None:
-                return None # Skip this sample if voxel loading failed
-
-            # --- Process other features ---
-            # Scale temperature directly (no function call)
-            scaled_temp = (raw_temp - self.temp_min) / (self.temp_max - self.temp_min)
-            scaled_temp = min(max(scaled_temp, 0.0), 1.0)  # Clip to [0, 1]
-
-            # Convert numpy array to tensor (CPU)
-            voxel_tensor = torch.from_numpy(voxel_np)
-
-            # Create tensors for temp and target
-            scaled_temp_tensor = torch.tensor([scaled_temp], dtype=torch.float32) # Shape (1,)
-            target_tensor = torch.tensor(target_rmsf, dtype=torch.float32) # Scalar
-
-            return {
-                'voxels': voxel_tensor,
-                'scaled_temps': scaled_temp_tensor,
-                'targets': target_tensor
-            }
-
-        except Exception as e:
-            # Log error with index for traceability
-            logger.debug(f"Error in sample index {idx}: {e}")
-            return None # Return None if any step fails
-
-    def get_cache_stats(self):
-        """Return cache statistics for logging."""
-        return self.domain_cache.get_stats()
+def process_voxel(voxel_raw: np.ndarray) -> Optional[np.ndarray]:
+    """Processes a raw voxel array from HDF5 to the target format."""
+    try:
+        if not isinstance(voxel_raw, np.ndarray): return None
+        if voxel_raw.dtype == bool: processed_array = voxel_raw.astype(TARGET_DTYPE)
+        elif np.issubdtype(voxel_raw.dtype, np.floating): processed_array = voxel_raw.astype(TARGET_DTYPE, copy=False)
+        elif np.issubdtype(voxel_raw.dtype, np.integer): processed_array = voxel_raw.astype(TARGET_DTYPE)
+        else: return None
+        if processed_array.ndim == 4 and processed_array.shape[-1] == INPUT_CHANNELS: processed_array = np.transpose(processed_array, (3, 0, 1, 2))
+        elif processed_array.ndim != len(TARGET_SHAPE): return None
+        if processed_array.shape != TARGET_SHAPE: return None
+        if not np.isfinite(processed_array).all(): return None
+        return processed_array
+    except Exception: return None
 
 def load_process_domain_from_handle(
     h5_handle,
     domain_id: str,
-    expected_channels: int = 5,
-    target_shape_chw: Optional[Tuple[int, int, int, int]] = (5, 21, 21, 21),
+    expected_channels: int = INPUT_CHANNELS,
+    target_shape_chw: Optional[Tuple[int, ...]] = TARGET_SHAPE,
     log_per_residue: bool = False
 ) -> Dict[str, np.ndarray]:
-    """
-    Process domain data from an already-open HDF5 file handle.
-    
-    Args:
-        h5_handle: Open h5py File handle
-        domain_id: Domain ID to process
-        expected_channels: Expected voxel channels
-        target_shape_chw: Target shape for validation
-        log_per_residue: Whether to log per-residue processing
-        
-    Returns:
-        Dictionary mapping residue IDs to processed voxel arrays
-    """
+    """Loads and processes all valid residues for a given domain_id from an open HDF5 handle."""
     domain_data_dict = {}
-    
+    processed_count = 0; failed_count = 0; t_start = time.perf_counter()
     try:
-        if domain_id not in h5_handle:
-            return {}
-            
-        domain_group = h5_handle[domain_id]
-        residue_group = None
-        
-        # Find the first valid residue group
-        potential_chain_keys = sorted([k for k in domain_group.keys() 
-                                      if isinstance(domain_group[k], h5py.Group)])
-        
+        if domain_id not in h5_handle: logger.warning(f"Domain '{domain_id}' not found..."); return {}
+        domain_group = h5_handle[domain_id]; residue_group = None
+        potential_chain_keys = [k for k in domain_group.keys() if isinstance(domain_group[k], h5py.Group)]
         for chain_key in potential_chain_keys:
-            try:
-                potential_res_group = domain_group[chain_key]
-                if any(key.isdigit() for key in potential_res_group.keys()):
-                    residue_group = potential_res_group
-                    break
-            except Exception:
-                continue
-                
-        if residue_group is None:
-            return {}
-            
-        # Process residues in the group
-        for resid_str in residue_group.keys():
-            if not resid_str.isdigit():
-                continue
-                
+             try:
+                  potential_res_group = domain_group[chain_key]
+                  if any(key.isdigit() for key in potential_res_group.keys()): residue_group = potential_res_group; break
+             except Exception: continue
+        if residue_group is None: logger.warning(f"No valid residue group for {domain_id}."); return {}
+        residue_keys = sorted([k for k in residue_group.keys() if k.isdigit()], key=int) # Process residues in order
+        for resid_str in residue_keys:
+            voxel_raw = None
             try:
                 voxel_dataset = residue_group[resid_str]
-                if not isinstance(voxel_dataset, h5py.Dataset):
-                    continue
-                    
+                if not isinstance(voxel_dataset, h5py.Dataset): continue
                 voxel_raw = voxel_dataset[:]
-                # Process the array once
-                if voxel_raw.dtype == bool:
-                    processed_array = voxel_raw.astype(np.float32)
-                elif np.issubdtype(voxel_raw.dtype, np.floating):
-                    processed_array = voxel_raw.astype(np.float32, copy=False)
-                elif np.issubdtype(voxel_raw.dtype, np.integer):
-                    processed_array = voxel_raw.astype(np.float32)
-                else:
-                    continue
-                    
-                # Transpose if needed
-                if processed_array.ndim == 4 and processed_array.shape[-1] == expected_channels:
-                    processed_array = np.transpose(processed_array, (3, 0, 1, 2))
-                
-                if np.isnan(processed_array).any() or np.isinf(processed_array).any():
-                    continue
-                    
-                domain_data_dict[resid_str] = processed_array
-            except Exception:
-                continue
-                
+                processed_array = process_voxel(voxel_raw)
+                if processed_array is not None: domain_data_dict[resid_str] = processed_array; processed_count += 1
+                else: failed_count += 1
+            except Exception as e: failed_count += 1; logger.warning(f"Error reading/processing {domain_id}:{resid_str}: {e}", exc_info=False)
+            finally: del voxel_raw
+        t_end = time.perf_counter()
+        if processed_count > 0 or failed_count > 0: logger.debug(f"Domain {domain_id}: Processed={processed_count}, Failed={failed_count}. Time: {(t_end-t_start)*1000:.1f}ms")
         return domain_data_dict
-        
-    except Exception:
-        return {}
+    except Exception as e: logger.error(f"Critical error loading domain {domain_id}: {e}", exc_info=True); return {}
 
-# Worker initialization function to create a persistent HDF5 connection
-def worker_init_fn(worker_id):
-    global worker_h5_file
-    # Get the HDF5 file path from the worker's dataset
-    try:
-        # Get the dataset from the worker's DataLoader
-        from torch.utils.data import get_worker_info
-        worker_info = get_worker_info()
-        if worker_info is not None:
-            dataset = worker_info.dataset
-            if hasattr(dataset, 'voxel_hdf5_path'):
-                hdf5_path = dataset.voxel_hdf5_path
-                worker_h5_file = h5py.File(hdf5_path, 'r')
-                # print(f"Worker {worker_id}: opened HDF5 file {hdf5_path}")
-    except Exception as e:
-        logger.warning(f"Worker {worker_id}: failed to open HDF5 file: {e}")
 
-# Create a simpler collate function with less error handling
-def simple_collate_fn(batch):
-    """A simpler collate function with minimal error handling."""
-    # Filter None items
-    batch = [item for item in batch if item is not None]
-    if not batch:
-        return None
-        
-    # Direct batch construction
-    return {
-        'voxels': torch.stack([item['voxels'] for item in batch]),
-        'scaled_temps': torch.stack([item['scaled_temps'] for item in batch]),
-        'targets': torch.stack([item['targets'] for item in batch])
-    }
+try:
+    import pyarrow.parquet as pq
+    PYARROW_AVAILABLE = True
+except ImportError:
+    PYARROW_AVAILABLE = False
 
-# --- Keep other existing functions but optimize where possible ---
+# ... [Keep other imports and helper functions as they are] ...
 
-# Retain load_process_voxels_from_hdf5 for compatibility but simplify
-def load_process_voxels_from_hdf5(
-    voxel_hdf5_path: str,
-    domain_ids: List[str],
-    expected_channels: int = 5,
-    target_shape_chw: Optional[Tuple[int, int, int, int]] = (5, 21, 21, 21),
-    log_per_residue: bool = False
-) -> Dict[str, Dict[str, np.ndarray]]:
-    voxel_hdf5_path = resolve_path(voxel_hdf5_path)
-    log_level = logging.DEBUG if len(domain_ids) == 1 else logging.INFO
-    logger.log(log_level, f"Loading voxels for {len(domain_ids)} domains")
-    processed_voxels = {}
+class ChunkedVoxelDataset(IterableDataset):
+    """
+    IterableDataset that loads and processes protein voxel data in chunks of domains.
     
-    try:
-        with h5py.File(voxel_hdf5_path, 'r') as f_h5:
-            for domain_id in domain_ids:
-                domain_data = load_process_domain_from_handle(
-                    f_h5, domain_id, expected_channels, target_shape_chw, log_per_residue
-                )
-                if domain_data:
-                    processed_voxels[domain_id] = domain_data
-    except Exception as e:
-        logger.exception(f"Error processing HDF5: {e}")
+    This dataset is designed for memory-efficient loading of large HDF5 files,
+    processing domains in manageable chunks rather than all at once.
+    """
+    def __init__(self,
+                 master_samples_path: str,
+                 split: str,
+                 domain_list: List[str],
+                 voxel_hdf5_path: str,
+                 temp_scaling_params: Dict[str, float],
+                 chunk_size: int = 100,
+                 shuffle_domain_list: bool = False):
+        """
+        Initialize the chunked dataset for a specific split.
         
-    return processed_voxels
-
-# Optimize PredictionDataset to use the same cache system
-class PredictionDataset(Dataset):
-    def __init__(
-        self, 
-        samples_to_load: List[Tuple[str, str]], 
-        voxel_hdf5_path: str, 
-        config: Dict[str, Any] = None,
-        expected_channels: int = 5, 
-        target_shape_chw: Optional[Tuple[int, int, int, int]] = (5, 21, 21, 21)
-    ):
-        self.voxel_hdf5_path = resolve_path(voxel_hdf5_path)
-        self.expected_channels = expected_channels
-        self.target_shape_chw = target_shape_chw
-        self.samples = []
-        self._dummy_shape = None
+        Args:
+            master_samples_path: Path to the master_samples.parquet file
+            split: Dataset split ('train', 'val', 'test')
+            domain_list: Complete list of domain IDs for this split
+            voxel_hdf5_path: Path to the HDF5 voxel file
+            temp_scaling_params: Dict with 'temp_min' and 'temp_max'
+            chunk_size: Number of domains to load per chunk
+            shuffle_domain_list: Whether to shuffle domains before chunking
+        """
+        super().__init__()
+        self.split = split
+        self.domain_list = domain_list  # Keep original order initially
+        self.voxel_hdf5_path = Path(voxel_hdf5_path).resolve()
+        self.temp_min = temp_scaling_params.get('temp_min', 280.0)
+        self.temp_max = temp_scaling_params.get('temp_max', 360.0)
         
-        # Initialize domain cache
-        cache_size_mb = config.get('data', {}).get('domain_cache_mb', 2000) if config else 2000
-        monitor_memory = config.get('data', {}).get('monitor_memory', True) if config else True
-        self.domain_cache = SafeDomainCache(max_size_mb=cache_size_mb, monitor_memory=monitor_memory)
-        
-        logger.info(f"Initializing PredictionDataset: Loading voxels for {len(samples_to_load)} samples...")
-        
-        # Group samples by domain for more efficient loading
-        domains_needed = defaultdict(list)
-        for d, r in samples_to_load:
-            domains_needed[d].append(r)
-            
-        loaded_count = 0
-        failed_load_samples = 0
-        progress = EnhancedProgressBar(len(domains_needed), desc="Prefetching Voxels (Prediction)")
-        
-        with h5py.File(self.voxel_hdf5_path, 'r') as f_h5:
-            for i, (domain_id, resid_list) in enumerate(domains_needed.items()):
-                try:
-                    # Load domain data with existing handle
-                    domain_data = load_process_domain_from_handle(
-                        f_h5, domain_id, expected_channels, target_shape_chw, log_per_residue=False
-                    )
-                    
-                    if domain_data:
-                        # Add domain to cache
-                        self.domain_cache.add(domain_id, domain_data)
-                        
-                        # Add valid samples to dataset
-                        for resid_str in resid_list:
-                            if resid_str in domain_data:
-                                self.samples.append((domain_id, resid_str))
-                                loaded_count += 1
-                                
-                                if self._dummy_shape is None and domain_data[resid_str] is not None:
-                                    self._dummy_shape = domain_data[resid_str].shape
-                            else:
-                                failed_load_samples += 1
-                    else:
-                        failed_load_samples += len(resid_list)
-                except Exception as e:
-                    logger.warning(f"Error pre-fetching {domain_id}: {e}")
-                    failed_load_samples += len(resid_list)
-                    
-                progress.update(i + 1)
-                
-        progress.finish()
-        logger.info(f"PredictionDataset initialized with {loaded_count} samples and {failed_load_samples} failures")
-        
-        if not self.samples:
-            logger.error("PredictionDataset: No valid voxel data loaded.")
-            self._set_dummy_shape()
-            
-    def _set_dummy_shape(self):
-        if self.target_shape_chw:
-            self._dummy_shape = self.target_shape_chw
+        if not isinstance(chunk_size, int) or chunk_size <= 0:
+            logger.warning(f"Invalid chunk_size ({chunk_size}), defaulting to 100.")
+            self.chunk_size = 100
         else:
-            self._dummy_shape = (self.expected_channels or 5, 21, 21, 21)
+            self.chunk_size = chunk_size
             
-    def __len__(self) -> int:
-        return len(self.samples)
+        self.shuffle_domain_list = shuffle_domain_list
+
+        # Load metadata from master samples file
+        self.metadata_lookup = {}
+        try:
+            logger.info(f"IterableDataset [{split}]: Loading metadata from {master_samples_path}")
+            t0 = time.time()
+            
+            # Select only necessary columns
+            cols = ['hdf5_domain_id', 'resid_str', 'raw_temp', 'target_rmsf', 'split']
+            
+            # Efficient reading with filtering if pyarrow is available
+            if PYARROW_AVAILABLE:
+                filters = [('split', '==', split)]
+                df = pd.read_parquet(master_samples_path, columns=cols, filters=filters)
+            else:
+                df_full = pd.read_csv(master_samples_path, usecols=cols)
+                df = df_full[df_full['split'] == split].copy()
+                del df_full  # Free memory
+
+            # Create lookup with string keys for consistency - this is the critical fix
+            for _, row in df.iterrows():
+                key = (str(row['hdf5_domain_id']), str(row['resid_str']))
+                if key not in self.metadata_lookup:
+                    self.metadata_lookup[key] = []
+                self.metadata_lookup[key].append((float(row['raw_temp']), float(row['target_rmsf'])))
+
+            logger.info(f"IterableDataset [{split}]: Metadata lookup created ({len(self.metadata_lookup)} entries) in {time.time()-t0:.2f}s")
+            del df
+            gc.collect()
+        except Exception as e:
+            logger.exception(f"IterableDataset [{split}]: Failed to load metadata lookup: {e}")
+            self.metadata_lookup = {}
+            self.domain_list = []
+
+    def _load_process_chunk_voxels(self, domain_chunk: List[str], worker_id: int) -> Dict[str, Dict[str, np.ndarray]]:
+        """
+        Loads and processes voxels for a list of domains.
         
-    def __getitem__(self, idx) -> Tuple[str, str, torch.Tensor]:
-        if idx >= len(self.samples):
-            return "ERROR", "0", self._get_dummy_voxel()
+        Args:
+            domain_chunk: List of domain IDs to process
+            worker_id: ID of the worker processing this chunk
             
-        domain_id, resid_str = self.samples[idx]
+        Returns:
+            Dictionary mapping domain IDs to dictionaries of residue voxels
+        """
+        t_start = time.perf_counter()
+        logger.debug(f"Worker {worker_id}: Loading chunk ({len(domain_chunk)} domains): {domain_chunk[:3]}...")
+        chunk_voxel_data: Dict[str, Dict[str, np.ndarray]] = {}
         
         try:
-            # Try to get from cache first
-            domain_data = self.domain_cache.get(domain_id)
-            
-            if domain_data is None:
-                # Reload if needed
-                with h5py.File(self.voxel_hdf5_path, 'r') as f_h5:
+            # Open HDF5 file locally within this method for the chunk
+            with h5py.File(self.voxel_hdf5_path, 'r') as h5_file:
+                for domain_id in domain_chunk:
                     domain_data = load_process_domain_from_handle(
-                        f_h5, domain_id, self.expected_channels, self.target_shape_chw
+                        h5_file, domain_id,
+                        expected_channels=INPUT_CHANNELS,
+                        target_shape_chw=TARGET_SHAPE,
+                        log_per_residue=False
                     )
                     if domain_data:
-                        self.domain_cache.add(domain_id, domain_data)
-            
-            voxel_np = None if domain_data is None else domain_data.get(resid_str)
-            
-            if voxel_np is None:
-                return domain_id, resid_str, self._get_dummy_voxel()
-                
-            return domain_id, resid_str, torch.from_numpy(voxel_np)
+                        chunk_voxel_data[domain_id] = domain_data
+                        
+            t_end = time.perf_counter()
+            logger.info(f"Worker {worker_id}: Loaded/processed chunk ({len(chunk_voxel_data)}/{len(domain_chunk)} domains ok) in {t_end - t_start:.2f}s.")
+            return chunk_voxel_data
         except Exception as e:
-            logger.debug(f"Error retrieving item {idx}: {e}")
-            return domain_id, resid_str, self._get_dummy_voxel()
-            
-    def _get_dummy_voxel(self) -> torch.Tensor:
-        if self._dummy_shape is None:
-            self._set_dummy_shape()
-        return torch.zeros(self._dummy_shape, dtype=torch.float32)
+            logger.error(f"Worker {worker_id}: Failed to open/read HDF5 for chunk: {e}", exc_info=True)
+            return {}
+
+    def _prepare_samples_for_chunk(self, chunk_voxel_data: Dict[str, Dict[str, np.ndarray]], worker_id: int) -> List[Dict[str, Any]]:
+        """
+        Combines loaded voxels with metadata for the chunk.
         
-    def get_cache_stats(self):
-        """Return cache statistics for logging."""
-        return self.domain_cache.get_stats()
+        Args:
+            chunk_voxel_data: Dictionary of domain voxel data
+            worker_id: ID of the worker processing this chunk
+            
+        Returns:
+            List of sample dictionaries with voxels, temperatures, and targets
+        """
+        t_start = time.perf_counter()
+        chunk_samples = []
+        skipped_meta = 0
+        temp_range = self.temp_max - self.temp_min
+        use_midpoint = abs(temp_range) < 1e-6
 
-# --- Optimized Helper Functions for Preprocessing ---
+        # Process domains/residues in a deterministic order for consistency
+        for domain_id in sorted(chunk_voxel_data.keys()):
+            residues = chunk_voxel_data[domain_id]
+            for resid_str in sorted(residues.keys(), key=lambda x: int(x) if x.isdigit() else 0):
+                voxel_np = residues[resid_str]
+                try:
+                    # Use string keys for lookup - matching the format used during initialization
+                    key = (str(domain_id), str(resid_str))
+                    metadata_entries = self.metadata_lookup.get(key, [])
+                    
+                    if not metadata_entries:
+                        # Debug logging to help diagnose lookup issues
+                        logger.debug(f"Worker {worker_id}: No metadata for {domain_id}:{resid_str}")
+                        skipped_meta += 1
+                        continue
+                        
+                    for raw_temp, target_rmsf in metadata_entries:
+                        # Scale temperature between 0-1
+                        if use_midpoint:
+                            scaled_temp = 0.5
+                        else:
+                            scaled_temp = (raw_temp - self.temp_min) / temp_range
+                        scaled_temp = min(max(scaled_temp, 0.0), 1.0)
 
+                        # Ensure voxel array is C-contiguous for efficient tensor conversion
+                        if not voxel_np.flags['C_CONTIGUOUS']:
+                            voxel_np = np.ascontiguousarray(voxel_np)
+                            
+                        # Convert to PyTorch tensors
+                        voxel_tensor = torch.from_numpy(voxel_np)
+                        scaled_temp_tensor = torch.tensor([scaled_temp], dtype=torch.float32)
+                        target_tensor = torch.tensor(target_rmsf, dtype=torch.float32)
+
+                        # Add sample to batch
+                        chunk_samples.append({
+                            'voxels': voxel_tensor, 
+                            'scaled_temps': scaled_temp_tensor, 
+                            'targets': target_tensor
+                        })
+                except Exception as e:
+                    logger.warning(f"Worker {worker_id}: Error preparing sample {domain_id}:{resid_str}: {e}")
+                    skipped_meta += 1
+
+        t_end = time.perf_counter()
+        if chunk_samples:
+            logger.info(f"Worker {worker_id} [{self.split}]: Yielding {len(chunk_samples)} samples for chunk.")
+        else:
+            logger.warning(f"Worker {worker_id} [{self.split}]: No samples prepared for chunk. Skipped {skipped_meta} residues.")
+        logger.debug(f"Worker {worker_id}: Prepared {len(chunk_samples)} samples, skipped {skipped_meta} (meta). Time: {t_end - t_start:.2f}s.")
+        return chunk_samples
+
+    def __iter__(self) -> Iterator[Dict[str, torch.Tensor]]:
+        """
+        Iterator logic loading, processing, and yielding samples chunk by chunk.
+        
+        Yields:
+            Dictionary with 'voxels', 'scaled_temps', and 'targets' tensors
+        """
+        # Get worker info for parallel processing
+        worker_info = get_worker_info()
+        if worker_info is None:
+            # Single-worker case (e.g., debugging)
+            worker_id = 0
+            num_workers = 1
+            domains_for_worker = self.domain_list
+        else:
+            # Multi-worker case
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            # Partition domains equally among workers
+            per_worker = int(math.ceil(len(self.domain_list) / float(num_workers)))
+            start_idx = worker_id * per_worker
+            end_idx = min(start_idx + per_worker, len(self.domain_list))
+            domains_for_worker = self.domain_list[start_idx:end_idx]
+
+        if not domains_for_worker:
+            logger.warning(f"Worker {worker_id}: No domains assigned for split '{self.split}'.")
+            return
+
+        # Make a copy to avoid modifying original list
+        effective_domain_list = list(domains_for_worker)
+        
+        # Shuffle if requested (typically for training)
+        if self.shuffle_domain_list:
+            np.random.shuffle(effective_domain_list)
+            logger.info(f"Worker {worker_id}: Shuffled domain list for split '{self.split}'.")
+        else:
+            logger.info(f"Worker {worker_id}: Processing domains in original order for split '{self.split}'.")
+
+        # Process domains in chunks
+        num_chunks = math.ceil(len(effective_domain_list) / self.chunk_size)
+        logger.info(f"Worker {worker_id}: Starting iteration for '{self.split}' split over {num_chunks} chunks (size ~{self.chunk_size}).")
+
+        for i in range(num_chunks):
+            chunk_start_idx = i * self.chunk_size
+            chunk_end_idx = min(chunk_start_idx + self.chunk_size, len(effective_domain_list))
+            domain_chunk_ids = effective_domain_list[chunk_start_idx:chunk_end_idx]
+            if not domain_chunk_ids:
+                continue
+
+            logger.info(f"Worker {worker_id} [{self.split}]: Processing chunk {i+1}/{num_chunks} ({len(domain_chunk_ids)} domains)")
+            
+            # Load and process voxels for this chunk
+            chunk_voxels = self._load_process_chunk_voxels(domain_chunk_ids, worker_id)
+            if not chunk_voxels:
+                logger.warning(f"Worker {worker_id} [{self.split}]: No voxels loaded for chunk {i+1}.")
+                continue
+
+            # Prepare samples from the loaded chunk
+            chunk_samples = self._prepare_samples_for_chunk(chunk_voxels, worker_id)
+            
+            # Free voxel memory after preparing samples
+            del chunk_voxels
+            gc.collect()
+
+            if not chunk_samples:
+                logger.warning(f"Worker {worker_id} [{self.split}]: No samples prepared for chunk {i+1}.")
+                continue
+
+            # Yield samples one by one
+            for sample in chunk_samples:
+                yield sample
+
+            # Clean up after yielding all samples from this chunk
+            logger.debug(f"Worker {worker_id}: Finished yielding chunk {i+1}. Clearing samples.")
+            del chunk_samples
+            gc.collect()
+
+        logger.info(f"Worker {worker_id}: Finished iteration for split '{self.split}'.")
+
+
+# No longer needs to manage persistent HDF5 handles for ChunkedVoxelDataset
+def worker_init_fn(worker_id):
+    """Worker initialization function (minimal version)."""
+    worker_info = get_worker_info()
+    if worker_info:
+        seed = worker_info.seed % 2**32 # Ensure seed is in valid range
+        np.random.seed(seed)
+        # torch.manual_seed(seed) # Can cause issues if main process also seeds
+        logger.debug(f"Worker {worker_id}: Initialized with NumPy seed {seed}")
+    else:
+         logger.warning(f"Worker {worker_id}: Could not get worker_info for seeding.")
+
+# --- simple_collate_fn (Keep as is) ---
+def simple_collate_fn(batch):
+    # ... (implementation as before) ...
+    batch = [item for item in batch if item is not None]
+    if not batch: logger.warning("Collate fn received empty batch."); return None
+    try:
+        return {
+            'voxels': torch.stack([item['voxels'] for item in batch]),
+            'scaled_temps': torch.stack([item['scaled_temps'] for item in batch]),
+            'targets': torch.stack([item['targets'] for item in batch])
+        }
+    except RuntimeError as e: logger.error(f"Collation error (shape mismatch?): {e}"); return None
+    except Exception as e: logger.error(f"Unexpected collation error: {e}", exc_info=True); return None
+
+
+
+# --- Preprocessing Helpers (Keep as before) ---
 def load_aggregated_rmsf_data(aggregated_rmsf_file: str) -> pd.DataFrame:
-    """Load aggregated RMSF data with type conversion optimizations."""
     rmsf_file = resolve_path(aggregated_rmsf_file)
     logger.info(f"Loading RMSF data from: {rmsf_file}")
-    if not os.path.exists(rmsf_file):
-        raise FileNotFoundError(f"RMSF file not found: {rmsf_file}")
-    
+    if not os.path.exists(rmsf_file): raise FileNotFoundError(f"RMSF file not found: {rmsf_file}")
     try:
-        # Use dtype specifications during loading to avoid later conversions
-        dtype_spec = {
-            'domain_id': str,
-            'resid': 'Int64',  # Allow NA values with pandas Int64
-            'temperature_feature': float,
-            'target_rmsf': float
-        }
+        dtype_spec = {'domain_id': str, 'resid': 'Int64', 'temperature_feature': float, 'target_rmsf': float}
         rmsf_df = pd.read_csv(rmsf_file, dtype=dtype_spec, low_memory=False)
         logger.info(f"Loaded {len(rmsf_df)} rows with optimized types")
+        return validate_aggregated_rmsf_data(rmsf_df)
+    except Exception as e: logger.exception(f"Failed to read RMSF CSV: {e}"); raise
+
+def create_master_rmsf_lookup(rmsf_df: pd.DataFrame) -> Dict[Tuple[str, int], List[Tuple[float, float]]]:
+    logger.info("Creating RMSF lookup..."); t0 = time.time(); required = ['domain_id', 'resid', 'temperature_feature', 'target_rmsf']
+    if not all(c in rmsf_df.columns for c in required): raise ValueError(f"Missing: {required}")
+    lookup = defaultdict(list); grouped = rmsf_df.groupby(['domain_id', 'resid'])
+    for name, group in grouped:
+        try: lookup[(str(name[0]), int(name[1]))] = list(zip(group['temperature_feature'].astype(float), group['target_rmsf'].astype(float)))
+        except (ValueError, TypeError): logger.warning(f"Skipping RMSF lookup entry due to conversion error for {name}")
+    base_lookup={}; added_count=0
+    for k, v in lookup.items():
+        base = k[0].split('_')[0]
+        if base != k[0]: base_key=(base, k[1]);
+        if base_key not in lookup and base_key not in base_lookup: base_lookup[base_key]=v; added_count+=1
+    lookup.update(base_lookup)
+    logger.info(f"RMSF lookup created: {len(lookup)} keys ({added_count} base names) in {time.time()-t0:.2f}s")
+    return dict(lookup)
+
+def create_domain_mapping(voxel_domain_keys: List[str], rmsf_domain_ids: List[str]) -> Dict[str, str]:
+    logger.info("Creating domain mapping...");
+    if not voxel_domain_keys: logger.warning("Voxel keys empty."); return {}
+    if not rmsf_domain_ids: logger.warning("RMSF IDs empty."); return {}
+    v_set = set(voxel_domain_keys); r_set = set(rmsf_domain_ids); mapping={}; matches={'exact':0, 'base':0}
+    r_base_map={r.split('_')[0]: r for r in rmsf_domain_ids};
+    for h_key in v_set:
+        if h_key in r_set: mapping[h_key]=h_key; matches['exact']+=1; continue
+        base_h = h_key.split('_')[0]
+        if base_h in r_set: mapping[h_key]=base_h; matches['base']+=1;
+        elif base_h in r_base_map: mapping[h_key]=r_base_map[base_h]; matches['base']+=1
+    total = len(mapping); cov = (total/len(voxel_domain_keys))*100 if voxel_domain_keys else 0
+    logger.info(f"Domain mapping: {total}/{len(voxel_domain_keys)} keys ({cov:.1f}%)"); logger.info(f"  Matches: Exact={matches['exact']}, Base={matches['base']}")
+    return mapping
+
+
+# --- PredictionDataset for evaluation and inference ---
+class PredictionDataset(Dataset):
+    """
+    Map-style dataset for prediction/evaluation that loads voxels
+    for specific domain-residue pairs.
+    """
+    def __init__(self, 
+                 samples_to_load: List[Tuple[str, str]],
+                 voxel_hdf5_path: str,
+                 expected_channels: int = INPUT_CHANNELS,
+                 target_shape_chw: Tuple[int, ...] = TARGET_SHAPE):
+        """
+        Initialize prediction dataset.
+        
+        Args:
+            samples_to_load: List of (domain_id, resid_str) tuples to load
+            voxel_hdf5_path: Path to HDF5 file with voxel data
+            expected_channels: Number of channels in voxel data
+            target_shape_chw: Expected shape of processed voxels
+        """
+        super().__init__()
+        self.voxel_hdf5_path = Path(voxel_hdf5_path).resolve()
+        self.expected_channels = expected_channels
+        self.target_shape = target_shape_chw
+        
+        # Load and filter samples
+        self.samples = []
+        self.voxel_data = {}
+        
+        logger.info(f"PredictionDataset: Loading {len(samples_to_load)} samples from HDF5...")
+        
+        # Pre-load and validate all samples
+        self._preload_samples(samples_to_load)
+        
+        logger.info(f"PredictionDataset: Successfully loaded {len(self.samples)} valid samples.")
+
+    def _preload_samples(self, samples_to_load: List[Tuple[str, str]]):
+        """
+        Pre-load and validate voxel data for specified samples.
+        
+        Args:
+            samples_to_load: List of (domain_id, resid_str) tuples to load
+        """
+        # Group by domain for efficient loading
+        domain_to_residues = defaultdict(list)
+        for domain_id, resid_str in samples_to_load:
+            domain_to_residues[domain_id].append(resid_str)
+            
+        # Load domains
+        valid_count = 0
+        with h5py.File(self.voxel_hdf5_path, 'r') as h5_file:
+            for domain_id, residues in domain_to_residues.items():
+                domain_data = load_process_domain_from_handle(
+                    h5_file, domain_id,
+                    expected_channels=self.expected_channels,
+                    target_shape_chw=self.target_shape
+                )
+                
+                # Add valid samples to the dataset
+                for resid_str in residues:
+                    if resid_str in domain_data:
+                        self.samples.append((domain_id, resid_str))
+                        self.voxel_data[(domain_id, resid_str)] = domain_data[resid_str]
+                        valid_count += 1
+                        
+        logger.info(f"PredictionDataset: Loaded {valid_count}/{len(samples_to_load)} valid voxel arrays.")
+
+    def __len__(self):
+        """Return number of samples in the dataset."""
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        """
+        Get a sample by index.
+        
+        Args:
+            idx: Sample index
+            
+        Returns:
+            Tuple of (domain_id, resid_str, voxel_tensor)
+        """
+        domain_id, resid_str = self.samples[idx]
+        voxel_array = self.voxel_data[(domain_id, resid_str)]
+        voxel_tensor = torch.from_numpy(voxel_array)
+        return domain_id, resid_str, voxel_tensor
+
+# --- DataLoader helper functions ---
+def worker_init_fn(worker_id):
+    """
+    Worker initialization function for DataLoader.
+    
+    Args:
+        worker_id: ID of the worker being initialized
+    """
+    worker_info = get_worker_info()
+    if worker_info:
+        # Set worker-specific random seed for reproducibility
+        seed = worker_info.seed % 2**32  # Ensure seed is in valid range
+        np.random.seed(seed)
+        logger.debug(f"Worker {worker_id}: Initialized with NumPy seed {seed}")
+    else:
+        logger.warning(f"Worker {worker_id}: Could not get worker_info for seeding.")
+
+def simple_collate_fn(batch):
+    """
+    Collate function for DataLoader that handles None values and shape mismatches.
+    
+    Args:
+        batch: Batch of samples to collate
+        
+    Returns:
+        Dictionary of batched tensors or None if batch is empty
+    """
+    # Filter out None values
+    batch = [item for item in batch if item is not None]
+    if not batch:
+        logger.warning("Collate fn received empty batch.")
+        return None
+        
+    try:
+        return {
+            'voxels': torch.stack([item['voxels'] for item in batch]),
+            'scaled_temps': torch.stack([item['scaled_temps'] for item in batch]),
+            'targets': torch.stack([item['targets'] for item in batch])
+        }
+    except RuntimeError as e:
+        logger.error(f"Collation error (shape mismatch?): {e}")
+        return None
+    except Exception as e:
+        logger.error(f"Unexpected collation error: {e}", exc_info=True)
+        return None
+
+# --- Preprocessing Helpers ---
+def load_aggregated_rmsf_data(aggregated_rmsf_file: str) -> pd.DataFrame:
+    """
+    Load and validate aggregated RMSF data from CSV.
+    
+    Args:
+        aggregated_rmsf_file: Path to CSV file with RMSF data
+        
+    Returns:
+        DataFrame with validated RMSF data
+        
+    Raises:
+        FileNotFoundError: If RMSF file not found
+        Exception: For other loading errors
+    """
+    rmsf_file = Path(aggregated_rmsf_file).resolve()
+    logger.info(f"Loading RMSF data from: {rmsf_file}")
+    
+    if not rmsf_file.exists():
+        raise FileNotFoundError(f"RMSF file not found: {rmsf_file}")
+        
+    try:
+        # Define expected dtypes for optimized loading
+        dtype_spec = {
+            'domain_id': str, 
+            'resid': 'Int64', 
+            'temperature_feature': float, 
+            'target_rmsf': float
+        }
+        
+        # Load CSV with optimized settings
+        rmsf_df = pd.read_csv(rmsf_file, dtype=dtype_spec, low_memory=False)
+        logger.info(f"Loaded {len(rmsf_df)} rows with optimized types")
+        
+        # Validate and clean data
+        from voxelflex.data.validators import validate_aggregated_rmsf_data
         return validate_aggregated_rmsf_data(rmsf_df)
     except Exception as e:
         logger.exception(f"Failed to read RMSF CSV: {e}")
         raise
 
 def create_master_rmsf_lookup(rmsf_df: pd.DataFrame) -> Dict[Tuple[str, int], List[Tuple[float, float]]]:
-    """Create and serialize RMSF lookup for reuse."""
+    """
+    Create lookup mapping (domain_id, resid) to list of (temperature, rmsf) pairs.
+    
+    Args:
+        rmsf_df: DataFrame with RMSF data
+        
+    Returns:
+        Dictionary mapping (domain_id, resid) to [(temp1, rmsf1), (temp2, rmsf2), ...]
+        
+    Raises:
+        ValueError: If required columns are missing
+    """
     logger.info("Creating RMSF lookup...")
-    start_time = time.time()
-    required_cols = ['domain_id', 'resid', 'temperature_feature', 'target_rmsf']
+    t0 = time.time()
     
-    if not all(col in rmsf_df.columns for col in required_cols):
-        raise ValueError(f"RMSF DataFrame missing required columns: {required_cols}")
+    # Check required columns
+    required = ['domain_id', 'resid', 'temperature_feature', 'target_rmsf']
+    if not all(c in rmsf_df.columns for c in required):
+        raise ValueError(f"Missing required columns: {required}")
     
-    # Use existing numeric columns without conversion if possible
+    # Group by domain and residue for efficient lookup
     lookup = defaultdict(list)
     grouped = rmsf_df.groupby(['domain_id', 'resid'])
     
     for name, group in grouped:
-        domain_id = str(name[0])
-        resid_int = int(name[1])
-        temp_rmsf_pairs = list(zip(
-            group['temperature_feature'].astype(float),
-            group['target_rmsf'].astype(float)
-        ))
-        lookup[(domain_id, resid_int)] = temp_rmsf_pairs
+        try:
+            # Create list of (temp, rmsf) tuples
+            lookup[(str(name[0]), int(name[1]))] = list(zip(
+                group['temperature_feature'].astype(float),
+                group['target_rmsf'].astype(float)
+            ))
+        except (ValueError, TypeError):
+            logger.warning(f"Skipping RMSF lookup entry due to conversion error for {name}")
     
-    # Create base name lookup as before
-    base_name_lookup = {}
-    for (domain_id, resid_int), pairs in lookup.items():
-        base_name = str(domain_id).split('_')[0]
-        if base_name != domain_id:
-            base_key = (base_name, resid_int)
-            if base_key not in lookup and base_key not in base_name_lookup:
-                base_name_lookup[base_key] = pairs
+    # Handle base domain IDs (without chain/model suffix)
+    base_lookup = {}
+    added_count = 0
     
-    original_keys = len(lookup)
-    lookup.update(base_name_lookup)
-    base_added = len(lookup) - original_keys
+    for k, v in lookup.items():
+        base = k[0].split('_')[0]
+        if base != k[0]:
+            base_key = (base, k[1])
+            if base_key not in lookup and base_key not in base_lookup:
+                base_lookup[base_key] = v
+                added_count += 1
     
-    duration = time.time() - start_time
-    logger.info(f"RMSF lookup created: {len(lookup)} keys ({base_added} base names added) in {duration:.2f}s")
+    # Merge base lookups into main lookup
+    lookup.update(base_lookup)
     
-    # Serialize the lookup for future use
-    try:
-        processed_dir = os.path.dirname(os.path.dirname(rmsf_df.iloc[0]['domain_id'])) 
-        if processed_dir:
-            lookup_path = os.path.join(processed_dir, "rmsf_lookup.json")
-            serializable_lookup = {}
-            for (domain_id, resid_int), pairs in lookup.items():
-                serializable_lookup[f"{domain_id}:{resid_int}"] = pairs
-            save_json(serializable_lookup, lookup_path)
-            logger.info(f"Serialized RMSF lookup to {lookup_path}")
-    except Exception as e:
-        logger.warning(f"Could not serialize RMSF lookup: {e}")
-    
+    logger.info(f"RMSF lookup created: {len(lookup)} keys ({added_count} base names) in {time.time()-t0:.2f}s")
     return dict(lookup)
 
 def create_domain_mapping(voxel_domain_keys: List[str], rmsf_domain_ids: List[str]) -> Dict[str, str]:
-    """Create and serialize domain mapping for reuse."""
+    """
+    Create mapping from HDF5 domain keys to RMSF domain IDs.
+    
+    Args:
+        voxel_domain_keys: List of domain keys from HDF5 file
+        rmsf_domain_ids: List of domain IDs from RMSF data
+        
+    Returns:
+        Dictionary mapping HDF5 keys to RMSF IDs
+    """
     logger.info("Creating domain mapping...")
+    
     if not voxel_domain_keys:
         logger.warning("Voxel keys empty.")
         return {}
+        
     if not rmsf_domain_ids:
         logger.warning("RMSF IDs empty.")
         return {}
     
-    voxel_keys_set = set(voxel_domain_keys)
-    rmsf_ids_set = set(rmsf_domain_ids)
+    # Create sets for efficient lookups
+    v_set = set(voxel_domain_keys)
+    r_set = set(rmsf_domain_ids)
+    
     mapping = {}
-    matches = {'exact': 0, 'base_match': 0}
+    matches = {'exact': 0, 'base': 0}
     
-    rmsf_base_to_full = {}
-    for rid in rmsf_domain_ids:
-        rmsf_base_to_full.setdefault(str(rid).split('_')[0], rid)
+    # Create mapping from base domain IDs to full IDs
+    r_base_map = {r.split('_')[0]: r for r in rmsf_domain_ids}
     
-    for hdf5_key in voxel_keys_set:
-        if hdf5_key in rmsf_ids_set:
-            mapping[hdf5_key] = hdf5_key
+    # Match each HDF5 key to RMSF ID
+    for h_key in v_set:
+        # Try exact match first
+        if h_key in r_set:
+            mapping[h_key] = h_key
             matches['exact'] += 1
             continue
-        base_hdf5 = str(hdf5_key).split('_')[0]
-        if base_hdf5 in rmsf_ids_set:
-            mapping[hdf5_key] = base_hdf5
-            matches['base_match'] += 1
-        elif base_hdf5 in rmsf_base_to_full:
-            mapping[hdf5_key] = rmsf_base_to_full[base_hdf5]
-            matches['base_match'] += 1
+            
+        # Try base domain match
+        base_h = h_key.split('_')[0]
+        if base_h in r_set:
+            mapping[h_key] = base_h
+            matches['base'] += 1
+        elif base_h in r_base_map:
+            mapping[h_key] = r_base_map[base_h]
+            matches['base'] += 1
     
-    total_mapped = len(mapping)
-    coverage = (total_mapped / len(voxel_domain_keys)) * 100 if voxel_domain_keys else 0
-    logger.info(f"Domain mapping: {total_mapped}/{len(voxel_domain_keys)} keys mapped ({coverage:.1f}%)")
-    logger.info(f"  Matches: Exact={matches['exact']}, Base={matches['base_match']}")
-    
-    # Serialize the mapping for future use
-    try:
-        processed_dir = os.path.dirname(os.path.dirname(voxel_domain_keys[0])) 
-        if processed_dir:
-            mapping_path = os.path.join(processed_dir, "domain_mapping.json")
-            save_json(mapping, mapping_path)
-            logger.info(f"Serialized domain mapping to {mapping_path}")
-    except Exception as e:
-        logger.warning(f"Could not serialize domain mapping: {e}")
+    # Log mapping statistics
+    total = len(mapping)
+    cov = (total/len(voxel_domain_keys))*100 if voxel_domain_keys else 0
+    logger.info(f"Domain mapping: {total}/{len(voxel_domain_keys)} keys ({cov:.1f}%)")
+    logger.info(f"  Matches: Exact={matches['exact']}, Base={matches['base']}")
     
     return mapping
+
+def load_list_from_file(file_path: str) -> List[str]:
+    """
+    Load a list of strings from a text file, one item per line.
+    
+    Args:
+        file_path: Path to text file
+        
+    Returns:
+        List of strings from file
+    """
+    file_path = Path(file_path)
+    
+    if not file_path.exists():
+        logger.warning(f"File not found: {file_path}. Returning empty list.")
+        return []
+        
+    try:
+        with open(file_path, 'r') as f:
+            # Read lines, strip whitespace, and filter out empty lines
+            items = [line.strip() for line in f if line.strip()]
+        
+        logger.debug(f"Loaded {len(items)} items from: {file_path}")
+        return items
+    except Exception as e:
+        logger.error(f"Failed to load list from {file_path}: {e}")
+        return []  # Return empty list on error

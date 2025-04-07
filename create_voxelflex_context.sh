@@ -43,29 +43,6 @@ echo "Project Goal & Workflow Overview:" >> "$OUTPUT_FILE"
 echo "---------------------------------" >> "$OUTPUT_FILE"
 # *** FIX: Use quoted EOF to prevent shell interpretation ***
 cat << 'EOF' >> "$OUTPUT_FILE"
-The primary goal of the 'voxelflex' package is to predict per-residue protein flexibility (Root Mean Square Fluctuation, RMSF) using 3D structural data (voxels) while incorporating temperature awareness. A single trained model should be capable of predicting RMSF for a given protein structure at a specific input temperature, intended as a component for a larger multi-modal prediction framework (OmniFlex).
-
-This version implements the **'Metadata Only Preprocessing'** workflow to address previous issues with I/O bottlenecks, excessive intermediate file creation, filesystem instability, and memory constraints during preprocessing attempts.
-
-**Core Workflow:**
-
-1.  **`preprocess` Command (Metadata Only):**
-    *   **Input:** Raw HDF5 voxel file (for keys/structure), aggregated multi-temperature RMSF CSV, domain split files (`.txt`).
-    *   **Process:** Loads RMSF data, HDF5 keys, creates mappings, loads domain splits, filters them, generates a **master list** of all valid samples across splits `(hdf5_domain_id, resid_str, resid_int, raw_temp, target_rmsf, split)`. This involves checking HDF5 residue keys against the RMSF lookup but **does not load or process voxel data**. Calculates temperature scaler based on *training* samples and saves to `temp_scaling_params.json` in the run's output directory.
-    *   **Output:** Saves the master sample list to a single file (`master_samples.parquet` or `.csv`) in `processed_dir`. Saves `failed_preprocess_domains.txt` in the run output directory. Minimal resource usage.
-
-2.  **`train` Command (On-Demand HDF5 Loading):**
-    *   **Input:** Config file, `master_samples.parquet` (or `.csv`), `temp_scaling_params.json`, raw HDF5 voxel file.
-    *   **Process:** Checks for master samples file (runs `preprocess` if missing/forced). Instantiates `VoxelDataset`. `DataLoader` with `num_workers > 0` coordinates workers. **Workers** execute `VoxelDataset.__getitem__` -> read required HDF5 voxel data **on-demand**, process (cast/transpose), scale temp, return tensors. Trains model.
-    *   **Output:** Model checkpoints (`.pt`), history (`.json`), logs.
-
-3.  **`predict` Command:** Loads model/scaler. Loads raw voxel data **on-demand** from HDF5, processes, runs inference. Saves predictions CSV.
-
-4.  **`evaluate` Command:** Merges predictions CSV and ground truth RMSF CSV. Calculates metrics. If permutation importance enabled, loads raw voxel data **on-demand** from HDF5. Saves metrics JSON.
-
-5.  **`visualize` Command:** Loads predictions CSV, ground truth RMSF CSV, optional history. Generates plots. Saves plots and optional data.
-
-This workflow minimizes preprocessing load/storage, shifting HDF5 interaction to parallel DataLoader workers during training.
 EOF
 echo "" >> "$OUTPUT_FILE"
 

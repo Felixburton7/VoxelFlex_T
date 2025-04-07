@@ -1,6 +1,7 @@
-# src/voxelflex/cli/cli.py (Optimized)
 """
 Command Line Interface for VoxelFlex (Temperature-Aware).
+
+Main entry point for voxelflex commands: preprocess, train, predict, evaluate, visualize.
 """
 
 import argparse
@@ -17,13 +18,22 @@ logger = get_logger("cli")
 MASTER_SAMPLES_FILENAME = "master_samples.parquet"
 
 def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
-    """Parse command line arguments."""
+    """
+    Parse command line arguments.
+    
+    Args:
+        args: Optional list of command line arguments (default: sys.argv[1:])
+        
+    Returns:
+        Parsed arguments namespace
+    """
     parser = argparse.ArgumentParser(
         prog="voxelflex", 
-        description="VoxelFlex: Preprocess metadata, train, predict, evaluate.",
+        description="VoxelFlex: Preprocess metadata, train, predict, evaluate, and visualize temperature-aware protein flexibility predictions.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
+    # Define common arguments for all commands
     common_parser_args = argparse.ArgumentParser(add_help=False)
     common_parser_args.add_argument(
         '-v', '--verbose', 
@@ -38,13 +48,14 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to YAML config file."
     )
     
+    # Define subcommands
     subparsers = parser.add_subparsers(
         dest="command", 
         help="Sub-command to run", 
         required=True
     )
 
-    # Preprocess command
+    # --- Preprocess command ---
     preprocess_parser = subparsers.add_parser(
         "preprocess", 
         help="Preprocess metadata (generate sample list).", 
@@ -52,7 +63,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     
-    # Train command
+    # --- Train command ---
     train_parser = subparsers.add_parser(
         "train", 
         help="Train model (loads HDF5 on demand).", 
@@ -64,8 +75,6 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         action="store_true", 
         help="Run metadata preprocessing first."
     )
-    
-    # Additional options for train
     train_parser.add_argument(
         "--subset", 
         type=float, 
@@ -73,7 +82,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Use a subset of training data (0.0-1.0)"
     )
     
-    # Predict command
+    # --- Predict command ---
     predict_parser = subparsers.add_parser(
         "predict", 
         help="Predict RMSF at a target temperature.", 
@@ -106,7 +115,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Optional: Specify output CSV filename."
     )
     
-    # Evaluate command
+    # --- Evaluate command ---
     evaluate_parser = subparsers.add_parser(
         "evaluate", 
         help="Evaluate model predictions.", 
@@ -126,7 +135,7 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
         help="Path to predictions CSV file."
     )
     
-    # Visualize command
+    # --- Visualize command ---
     visualize_parser = subparsers.add_parser(
         "visualize", 
         help="Create performance visualizations.", 
@@ -148,12 +157,20 @@ def parse_args(args: Optional[List[str]] = None) -> argparse.Namespace:
 
     return parser.parse_args(args)
 
-def main(cli_args: Optional[List[str]] = None) -> None:
-    """Main CLI entry point."""
+def main(cli_args: Optional[List[str]] = None) -> int:
+    """
+    Main CLI entry point for voxelflex.
+    
+    Args:
+        cli_args: Optional list of command line arguments (default: sys.argv[1:])
+        
+    Returns:
+        Exit code (0 = success, >0 = error)
+    """
     start_time = time.time()
     args = parse_args(cli_args)
     
-    # Configure logging based on verbosity
+    # Configure initial logging based on verbosity
     console_log_level = "DEBUG" if args.verbose >= 2 else "INFO" if args.verbose == 1 else "WARNING"
     setup_logging(console_level=console_log_level, file_level="DEBUG", log_file=None)
     
@@ -260,25 +277,26 @@ def main(cli_args: Optional[List[str]] = None) -> None:
             
         else:
             logger.error(f"Unknown command: {args.command}")
-            sys.exit(1)
+            return 1
 
         log_section_header(logger, f"COMMAND '{args.command}' COMPLETED")
+        return 0
 
     except FileNotFoundError as e:
         logger.error(f"File Not Found Error: {e}")
-        sys.exit(1)
+        return 1
     except ValueError as e:
         logger.error(f"Value Error: {e}")
-        sys.exit(1)
+        return 1
     except RuntimeError as e:
         logger.error(f"Runtime Error: {e}")
-        sys.exit(1)
+        return 1
     except ImportError as e:
         logger.error(f"Import Error: {e}. Ensure required libraries (e.g., pyarrow) are installed.")
-        sys.exit(1)
+        return 1
     except Exception as e:
         logger.exception(f"An unexpected error occurred: {e}")
-        sys.exit(1)
+        return 1
     finally:
         end_time = time.time()
         total_duration = end_time - start_time
@@ -287,4 +305,4 @@ def main(cli_args: Optional[List[str]] = None) -> None:
         logging.shutdown()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
