@@ -1,4 +1,3 @@
-Okay, here is a detailed summary of the VoxelFlex project based on the context provided and our discussion.
 
 **1. Project Aim & Goal**
 
