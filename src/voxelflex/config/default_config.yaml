@@ -46,7 +46,7 @@ training:
   learning_rate: 0.0005
   weight_decay: 1e-4
   seed: 42
-  num_workers: 4  # Adjust based on CPU cores and memory for chunk processing
+  num_workers: 2  # Adjust based on CPU cores and memory for chunk processing
   pin_memory: true  # Usually beneficial with GPU
   prefetch_factor: 2  # Default for DataLoader
   resume_checkpoint: null
